@@ -1,0 +1,21 @@
+# Default settings for dag_to_edl.py (KEY=value, UTF-8).
+# Copy to a custom file and pass:  --var-file path\to\custom.var
+# The bundled default always loads first; a custom file overrides keys only.
+# CLI flags override merged VAR values when you pass them explicitly.
+#
+# HOST=https://192.0.2.1
+# API_KEY=  (prefer PAN_API_KEY / --api-key instead of storing secrets here)
+# VSYS=vsys1
+# GROUP=MyDynamicGroup
+# OUTPUT=edl-ip-list.txt
+# TIMEOUT=60
+# MAX_ENTRIES=49999
+# EXPIRED_OUTPUT=
+# INSECURE=false
+# EXPIRE_DAYS=0
+
+TIMEOUT=60
+MAX_ENTRIES=49999
+VSYS=vsys1
+INSECURE=false
+EXPIRE_DAYS=0

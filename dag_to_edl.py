@@ -16,7 +16,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Dict, Iterator, List, Mapping, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Set, Tuple, Union
 from urllib.parse import urljoin
 
 try:
@@ -28,6 +28,145 @@ except ImportError as exc:  # pragma: no cover
 
 # Palo Alto EDL IP list size guidance (stay under platform limits).
 MAX_EDL_ENTRIES_DEFAULT = 49999
+
+DEFAULT_VAR_BASENAME = "dag_to_edl.default.var"
+
+
+def script_directory() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def default_var_file_path() -> str:
+    return os.path.join(script_directory(), DEFAULT_VAR_BASENAME)
+
+
+# ---------------------------------------------------------------------------
+# VAR files (KEY=value, UTF-8). Default VAR always loads; --var-file merges
+# overrides. CLI arguments override merged VAR values.
+# ---------------------------------------------------------------------------
+
+
+def _parse_bool_var(value: str) -> bool:
+    v = value.strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def parse_var_file(path: str) -> Dict[str, Union[str, List[str]]]:
+    """
+    Load KEY=value lines. Blank lines and lines starting with # are ignored.
+    Leading/trailing whitespace on keys and values is stripped.
+    Duplicate GROUP= lines append to a list; other duplicate keys replace.
+    """
+    out: Dict[str, Union[str, List[str]]] = {}
+    if not os.path.isfile(path):
+        return out
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        for _lineno, line in enumerate(f, start=1):
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            if "=" not in raw:
+                continue
+            key, val = raw.split("=", 1)
+            key_u = key.strip().upper()
+            val_s = val.strip()
+            if not key_u:
+                continue
+            if key_u == "GROUP":
+                lst = out.get("GROUP")
+                if isinstance(lst, list):
+                    lst.append(val_s)
+                elif isinstance(lst, str):
+                    out["GROUP"] = [lst, val_s]
+                elif val_s:
+                    out["GROUP"] = val_s
+                continue
+            out[key_u] = val_s
+    return out
+
+
+def merge_var_settings(
+    default_path: str,
+    custom_path: Optional[str],
+) -> Dict[str, Union[str, List[str]]]:
+    """Default VAR loads first; custom VAR replaces any keys it defines."""
+    merged = dict(parse_var_file(default_path))
+    if not custom_path:
+        return merged
+    merged.update(parse_var_file(custom_path))
+    return merged
+
+
+def _var_groups_to_list(g: Union[str, List[str], None]) -> List[str]:
+    if g is None:
+        return []
+    if isinstance(g, str):
+        return [g] if g.strip() else []
+    return [x for x in g if str(x).strip()]
+
+
+def var_settings_to_arg_defaults(
+    var: Mapping[str, Union[str, List[str]]],
+) -> Dict[str, Any]:
+    """Map merged VAR dict to argparse-friendly defaults (typed)."""
+    d: Dict[str, Any] = {}
+    if "HOST" in var and str(var["HOST"]).strip():
+        d["host"] = str(var["HOST"]).strip()
+    if "API_KEY" in var and str(var["API_KEY"]).strip():
+        d["api_key"] = str(var["API_KEY"]).strip()
+    if "VSYS" in var and str(var["VSYS"]).strip():
+        d["vsys"] = str(var["VSYS"]).strip()
+    if "OUTPUT" in var and str(var["OUTPUT"]).strip():
+        d["output"] = str(var["OUTPUT"]).strip()
+    if "TIMEOUT" in var and str(var["TIMEOUT"]).strip():
+        try:
+            d["timeout"] = float(str(var["TIMEOUT"]).strip())
+        except ValueError:
+            pass
+    if "MAX_ENTRIES" in var and str(var["MAX_ENTRIES"]).strip():
+        try:
+            d["max_entries"] = int(str(var["MAX_ENTRIES"]).strip(), 10)
+        except ValueError:
+            pass
+    if "EXPIRED_OUTPUT" in var:
+        eo = str(var["EXPIRED_OUTPUT"]).strip()
+        d["expired_output"] = eo if eo else None
+    if "INSECURE" in var and str(var["INSECURE"]).strip():
+        d["insecure"] = _parse_bool_var(str(var["INSECURE"]))
+    if "EXPIRE_DAYS" in var and str(var["EXPIRE_DAYS"]).strip():
+        try:
+            d["expire_days"] = int(str(var["EXPIRE_DAYS"]).strip(), 10)
+        except ValueError:
+            pass
+    return d
+
+
+def extract_var_file_argv(argv: List[str]) -> Tuple[Optional[str], List[str]]:
+    """Split argv so a pre-parser can read --var-file before applying VAR defaults."""
+    var_file: Optional[str] = None
+    rest: List[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--var-file":
+            if i + 1 >= len(argv):
+                raise ValueError("--var-file requires a path")
+            var_file = argv[i + 1]
+            i += 2
+        elif a.startswith("--var-file="):
+            var_file = a.split("=", 1)[1]
+            i += 1
+        else:
+            rest.append(a)
+            i += 1
+    return var_file, rest
+
+
+def argv_has_flag(argv: List[str], long_opt: str) -> bool:
+    """True if argv contains --long-opt or --long-opt=value (or short form -x if provided)."""
+    eq = long_opt + "="
+    return any(a == long_opt or a.startswith(eq) for a in argv)
+
 
 # ---------------------------------------------------------------------------
 # Comment schema (machine-readable, ASCII)
@@ -205,6 +344,44 @@ def apply_max_entry_eviction(
             del verbatim_by_indicator[k]
 
     return ordered[n_evict:], expired_lines
+
+
+def apply_age_expiration(
+    meta_by_indicator: Dict[str, EntryMeta],
+    verbatim_by_indicator: Dict[str, str],
+    expire_days: int,
+    today: str,
+    removal_date: str,
+) -> List[str]:
+    """
+    Remove structured entries whose comment |last= UTC calendar date is at
+    least expire_days old relative to today (UTC calendar dates), using
+    (today - last).days >= expire_days. The |last= field is the most recent
+    run date the indicator appeared in the DAG fetch.
+    Verbatim-only rows are skipped (no structured last= metadata).
+    """
+    if expire_days < 1:
+        return []
+    try:
+        today_d = date.fromisoformat(today)
+    except ValueError:
+        return []
+    expired_lines: List[str] = []
+    for k in list(meta_by_indicator.keys()):
+        meta = meta_by_indicator[k]
+        try:
+            last_d = date.fromisoformat(meta.last)
+        except ValueError:
+            continue
+        age_days = (today_d - last_d).days
+        if age_days < expire_days:
+            continue
+        expired_lines.append(
+            format_expired_structured_line(k, meta, removal_date)
+        )
+        del meta_by_indicator[k]
+        verbatim_by_indicator.pop(k, None)
+    return expired_lines
 
 
 def merge_and_write_expired_archive(
@@ -483,79 +660,173 @@ def write_edl_atomic(
         raise
 
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+def parse_args(
+    argv: Optional[List[str]] = None,
+) -> Tuple[argparse.Namespace, Dict[str, Union[str, List[str]]]]:
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    try:
+        var_path_opt, argv_rest = extract_var_file_argv(argv_list)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    if var_path_opt and not os.path.isfile(var_path_opt):
+        print(f"error: --var-file not found: {var_path_opt}", file=sys.stderr)
+        raise SystemExit(2)
+
+    merged_var = merge_var_settings(default_var_file_path(), var_path_opt)
+    var_arg_defaults = var_settings_to_arg_defaults(merged_var)
+
+    runtime_defaults: Dict[str, Any] = {
+        "api_key": os.environ.get("PAN_API_KEY", ""),
+        "vsys": os.environ.get("PAN_VSYS", "vsys1"),
+        "timeout": 60.0,
+        "max_entries": MAX_EDL_ENTRIES_DEFAULT,
+        "expired_output": None,
+        "insecure": False,
+        "expire_days": 0,
+        "host": None,
+        "output": None,
+    }
+    runtime_defaults.update(var_arg_defaults)
+
     p = argparse.ArgumentParser(
-        description="Export PAN-OS dynamic address group members to an IP EDL text file."
+        description=(
+            "Export PAN-OS dynamic address group members to an IP EDL text file. "
+            "The bundled default VAR file is always loaded; use --var-file to override "
+            "keys. CLI flags override merged VAR values."
+        ),
+        epilog=(
+            f"VAR files: default is {DEFAULT_VAR_BASENAME} next to this script "
+            f"({default_var_file_path()}). Syntax: KEY=value lines; # comments. "
+            "Keys: HOST, API_KEY, VSYS, GROUP (repeat per group), OUTPUT, TIMEOUT, "
+            "MAX_ENTRIES, EXPIRED_OUTPUT, INSECURE, EXPIRE_DAYS."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.set_defaults(**runtime_defaults)
+
     p.add_argument(
         "--host",
-        required=True,
-        help="NGFW base URL, e.g. https://192.0.2.1",
+        help="NGFW base URL, e.g. https://192.0.2.1 (VAR: HOST)",
     )
     p.add_argument(
         "--api-key",
-        default=os.environ.get("PAN_API_KEY", ""),
-        help="XML API key (default: env PAN_API_KEY)",
+        help="XML API key (default: env PAN_API_KEY or VAR: API_KEY)",
     )
     p.add_argument(
         "--vsys",
-        default=os.environ.get("PAN_VSYS", "vsys1"),
-        help="Virtual system name (default: vsys1 or PAN_VSYS)",
+        help="Virtual system name (VAR: VSYS)",
     )
     p.add_argument(
         "--group",
         action="append",
         dest="groups",
         metavar="NAME",
-        required=True,
-        help="Dynamic address group name (repeat for multiple groups)",
+        help="Dynamic address group name, repeat for multiple (VAR: GROUP lines)",
     )
     p.add_argument(
         "--output",
         "-o",
-        required=True,
-        help="Output EDL file path",
+        metavar="PATH",
+        help="Output EDL file path (VAR: OUTPUT)",
     )
     p.add_argument(
         "--insecure",
         action="store_true",
-        help="Disable TLS certificate verification (lab use only)",
+        help="Disable TLS certificate verification (lab use only; VAR: INSECURE)",
     )
     p.add_argument(
         "--timeout",
         type=float,
-        default=60.0,
-        help="HTTP timeout seconds (default: 60)",
+        help="HTTP timeout seconds (VAR: TIMEOUT)",
     )
     p.add_argument(
         "--max-entries",
         type=int,
-        default=MAX_EDL_ENTRIES_DEFAULT,
         metavar="N",
         help=(
-            f"Maximum lines in the main EDL file (default: {MAX_EDL_ENTRIES_DEFAULT}). "
-            "Oldest rows are removed first when exceeded."
+            f"Maximum lines in the main EDL file (VAR: MAX_ENTRIES; "
+            f"code default {MAX_EDL_ENTRIES_DEFAULT}). Oldest rows are removed first "
+            "when exceeded."
+        ),
+    )
+    p.add_argument(
+        "--expire-days",
+        type=int,
+        metavar="N",
+        dest="expire_days",
+        help=(
+            "Also remove structured lines whose |last= date in the comment is at "
+            "least N UTC calendar days before today (0 disables; VAR: EXPIRE_DAYS). "
+            "Runs before --max-entries eviction; removed lines go to the expired archive."
         ),
     )
     p.add_argument(
         "--expired-output",
         metavar="PATH",
-        default=None,
         help=(
-            "Unlimited archive for capacity-evicted lines (default: <output> with "
-            "'.expired' before the extension, e.g. edl.expired.txt)"
+            "Unlimited archive for evicted lines (VAR: EXPIRED_OUTPUT; default: "
+            "<output> with '.expired' before the extension)"
         ),
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv_rest)
+
+    return args, merged_var
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
-    if not args.api_key.strip():
-        print("error: missing API key; pass --api-key or set PAN_API_KEY", file=sys.stderr)
+    try:
+        args, merged_var = parse_args(argv)
+    except SystemExit as e:
+        code = e.code
+        if code in (0, None, False):
+            return 0
+        if isinstance(code, int):
+            return code
+        print(str(code), file=sys.stderr)
         return 2
 
-    groups = list(dict.fromkeys(args.groups))  # de-dupe, preserve order
+    if not args.api_key or not str(args.api_key).strip():
+        print(
+            "error: missing API key; pass --api-key, set PAN_API_KEY, or VAR API_KEY",
+            file=sys.stderr,
+        )
+        return 2
+
+    argv_for_flags = list(sys.argv[1:] if argv is None else argv)
+    try:
+        _, argv_rest = extract_var_file_argv(argv_for_flags)
+    except ValueError:
+        argv_rest = argv_for_flags
+
+    if argv_has_flag(argv_rest, "--group"):
+        groups = list(dict.fromkeys(args.groups or []))
+    else:
+        groups = list(dict.fromkeys(_var_groups_to_list(merged_var.get("GROUP"))))
+
+    if not args.host or not str(args.host).strip():
+        print(
+            "error: missing --host (CLI) or HOST= in VAR files",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.output or not str(args.output).strip():
+        print(
+            "error: missing --output (CLI) or OUTPUT= in VAR files",
+            file=sys.stderr,
+        )
+        return 2
+    if not groups:
+        print(
+            "error: no dynamic address groups; pass --group or set GROUP= in VAR files",
+            file=sys.stderr,
+        )
+        return 2
+
+    expire_days = int(args.expire_days or 0)
+    if expire_days < 0:
+        expire_days = 0
 
     lines = load_edl_lines(args.output)
     existing, verbatim, file_warns = parse_edl_file(lines)
@@ -568,11 +839,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         member_to_groups = build_fetch_map(
             groups,
-            args.host,
-            args.api_key.strip(),
-            args.vsys,
+            str(args.host).strip(),
+            str(args.api_key).strip(),
+            str(args.vsys),
             verify,
-            args.timeout,
+            float(args.timeout),
         )
     except requests.RequestException as e:
         print(f"error: HTTP request failed: {e}", file=sys.stderr)
@@ -581,25 +852,44 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-
     merged = merge_edl(existing, member_to_groups, today)
     fetched_keys = set(member_to_groups.keys())
 
     merged_m = dict(merged)
     verbatim_m = dict(verbatim)
-    ordered_after, expired_new = apply_max_entry_eviction(
+    expired_new: List[str] = []
+
+    expired_new.extend(
+        apply_age_expiration(
+            merged_m,
+            verbatim_m,
+            expire_days,
+            today,
+            today,
+        )
+    )
+
+    ordered_after, expired_cap = apply_max_entry_eviction(
         merged_m,
         verbatim_m,
         fetched_keys,
-        args.max_entries,
+        int(args.max_entries),
         today,
     )
-    expired_path = args.expired_output or default_expired_output_path(args.output)
+    expired_new.extend(expired_cap)
+
+    expired_path = args.expired_output or default_expired_output_path(
+        str(args.output).strip()
+    )
     if expired_new:
         merge_and_write_expired_archive(expired_path, expired_new)
 
     write_edl_atomic(
-        args.output, merged_m, verbatim_m, fetched_keys, ordered_keys=ordered_after
+        str(args.output).strip(),
+        merged_m,
+        verbatim_m,
+        fetched_keys,
+        ordered_keys=ordered_after,
     )
     return 0
 

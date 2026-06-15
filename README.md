@@ -21,17 +21,43 @@ python dag_to_edl.py --host https://192.0.2.1 ^
   --output edl-ip-list.txt
 ```
 
+### VAR files (default + optional override)
+
+The script always loads **`dag_to_edl.default.var`** from the same directory as `dag_to_edl.py` (if the file is missing, it is treated as empty). You may pass **`--var-file PATH`** to load a second file whose keys **replace** any keys from the default file (shallow merge: same key in the custom file wins).
+
+Format: one **`KEY=value`** per line, UTF-8; blank lines and lines starting with **`#`** are ignored. Duplicate **`GROUP=`** lines in one file define multiple groups.
+
+Supported keys (CLI flags override merged VAR when you pass them explicitly):
+
+| Key | Maps to |
+|-----|---------|
+| `HOST` | `--host` |
+| `API_KEY` | `--api-key` (prefer `PAN_API_KEY` / secrets manager) |
+| `VSYS` | `--vsys` |
+| `GROUP` | `--group` (repeat, or multiple `GROUP=` lines) |
+| `OUTPUT` | `--output` / `-o` |
+| `TIMEOUT` | `--timeout` |
+| `MAX_ENTRIES` | `--max-entries` |
+| `EXPIRED_OUTPUT` | `--expired-output` (empty value = use built-in default path) |
+| `INSECURE` | `--insecure` (`true` / `1` / `yes` / `on`) |
+| `EXPIRE_DAYS` | `--expire-days` (integer; `0` disables age expiry) |
+
+If you use **`--group`** on the command line, **only** those groups are used for that run (VAR `GROUP` lines are ignored). If you omit **`--group`**, groups must come from **`GROUP=`** in the merged VAR files.
+
 - **`--group`**: repeat for multiple DAGs. Members are merged; if the same indicator appears in more than one group in a single run, the `dag` field in the comment uses the **alphabetically first** group name among those that contained the indicator.
 - **`PAN_API_KEY`**: XML API key (or pass `--api-key`).
 - **`PAN_VSYS`**: optional; default `vsys1` (same as `--vsys`).
 - **`--insecure`**: disable TLS certificate verification (lab only).
 - **`--timeout`**: HTTP timeout in seconds (default 60).
 - **`--max-entries`**: maximum lines in the main EDL (default 49999); oldest rows are evicted first when exceeded.
+- **`--expire-days`**: in addition to the size cap, remove structured lines whose comment **`last=`** (UTC calendar date of the most recent run the indicator appeared in the DAG fetch) is at least **N** full days before today. **`0`** disables. Removed lines go to the same expired archive as capacity evictions. Runs **before** `--max-entries` eviction. Verbatim lines without parseable metadata are not age-expired.
 - **`--expired-output`**: path to the unlimited expired-lines archive (default: same directory as `--output`, with `.expired` before the extension, e.g. `edl.txt` → `edl.expired.txt`).
 
 ## Size limit and expired archive
 
 The main list is capped (default **49,999** entries). Output order is **oldest first**: structured lines sort by `orig` (then indicator); lines without parseable metadata sort **after** all structured lines.
+
+**Age expiry** (`--expire-days` / `EXPIRE_DAYS`): structured entries whose **`last=`** date is **N** or more UTC calendar days before the run date are removed first and written to the expired archive (same `|rem=` convention as capacity evictions).
 
 When the cap is exceeded, rows are dropped from the **top** of that ordering. Each dropped line is recorded in the expired file with the **same comment text as at removal**, plus **`|rem=YYYY-MM-DD`** (UTC). Verbatim-only lines get ` |rem=YYYY-MM-DD` appended to the preserved line.
 

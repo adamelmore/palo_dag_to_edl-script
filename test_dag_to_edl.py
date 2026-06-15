@@ -192,5 +192,71 @@ class TestDefaultExpiredPath(unittest.TestCase):
         self.assertTrue(p.endswith("list.expired.txt"))
 
 
+class TestVarFiles(unittest.TestCase):
+    def test_parse_group_duplicates_become_list(self):
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".var", delete=False, encoding="utf-8"
+        ) as f:
+            f.write("GROUP=A\nGROUP=B\n")
+            path = f.name
+        try:
+            d = m.parse_var_file(path)
+            self.assertEqual(d["GROUP"], ["A", "B"])
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_custom_overrides_default(self):
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".var", delete=False, encoding="utf-8"
+        ) as d1:
+            d1.write("MAX_ENTRIES=100\nTIMEOUT=30\n")
+            p1 = d1.name
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".var", delete=False, encoding="utf-8"
+        ) as d2:
+            d2.write("MAX_ENTRIES=50\n")
+            p2 = d2.name
+        try:
+            merged = m.merge_var_settings(p1, p2)
+            self.assertEqual(merged["MAX_ENTRIES"], "50")
+            self.assertEqual(merged["TIMEOUT"], "30")
+        finally:
+            Path(p1).unlink(missing_ok=True)
+            Path(p2).unlink(missing_ok=True)
+
+
+class TestAgeExpiration(unittest.TestCase):
+    def test_removes_when_last_old_enough(self):
+        meta = {
+            "10.0.0.1": m.EntryMeta(
+                dag="G", orig="2026-01-01", last="2026-06-01", cnt=1
+            ),
+            "10.0.0.2": m.EntryMeta(
+                dag="G", orig="2026-06-10", last="2026-06-14", cnt=1
+            ),
+        }
+        verbatim: dict = {}
+        expired = m.apply_age_expiration(
+            meta, verbatim, expire_days=7, today="2026-06-15", removal_date="2026-06-15"
+        )
+        self.assertEqual(len(expired), 1)
+        self.assertIn("10.0.0.1", expired[0])
+        self.assertNotIn("10.0.0.1", meta)
+        self.assertIn("10.0.0.2", meta)
+
+    def test_disabled_when_zero(self):
+        meta = {
+            "10.0.0.1": m.EntryMeta(
+                dag="G", orig="2026-01-01", last="2026-01-01", cnt=1
+            ),
+        }
+        verbatim: dict = {}
+        expired = m.apply_age_expiration(
+            meta, verbatim, expire_days=0, today="2026-06-15", removal_date="2026-06-15"
+        )
+        self.assertEqual(expired, [])
+        self.assertIn("10.0.0.1", meta)
+
+
 if __name__ == "__main__":
     unittest.main()
