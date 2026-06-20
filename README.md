@@ -40,6 +40,8 @@ Supported keys (CLI flags override merged VAR when you pass them explicitly):
 | `MAX_ENTRIES` | `--max-entries` |
 | `EXPIRED_OUTPUT` | `--expired-output` (empty value = use built-in default path) |
 | `INSECURE` | `--insecure` (`true` / `1` / `yes` / `on`) |
+| `CA_BUNDLE` | `--ca-bundle` (path to PEM file trusted for HTTPS when using a private CA) |
+| `OUTPUT_BACKUP_COUNT` | `--backup-count` (integer; `0` disables numbered backups before each write; default **5**) |
 | `EXPIRE_DAYS` | `--expire-days` (integer; `0` disables age expiry) |
 
 If you use **`--group`** on the command line, **only** those groups are used for that run (VAR `GROUP` lines are ignored). If you omit **`--group`**, groups must come from **`GROUP=`** in the merged VAR files.
@@ -48,6 +50,8 @@ If you use **`--group`** on the command line, **only** those groups are used for
 - **`PAN_API_KEY`**: XML API key (or pass `--api-key`).
 - **`PAN_VSYS`**: optional; default `vsys1` (same as `--vsys`).
 - **`--insecure`**: disable TLS certificate verification (lab only).
+- **`--ca-bundle`**: path to a PEM file of CA certificate(s) to use for TLS verification when the management interface presents a certificate signed by a **private CA** (VAR: `CA_BUNDLE`). **`--insecure` takes precedence** and skips verification entirely. If `CA_BUNDLE` is not set in VAR files, the script checks these environment variables in order: **`PAN_SSL_CA_BUNDLE`**, **`REQUESTS_CA_BUNDLE`** (common for Python `requests`), **`SSL_CERT_FILE`** (OpenSSL-style). Precedence for the bundle path is: **CLI** overrides **VAR** overrides **env**.
+- **`--backup-count`**: before replacing the main `--output` file, if it already exists, rotate logrotate-style numbered siblings `output.1` … `output.N` (current file becomes `output.1`, previous `output.1` becomes `output.2`, oldest `output.N` is removed). **`N`** defaults to **5**; use **`0`** to disable. VAR: `OUTPUT_BACKUP_COUNT`. If that key is absent from merged VAR files, **`PAN_OUTPUT_BACKUP_COUNT`** in the process environment is used. CLI overrides the effective value.
 - **`--timeout`**: HTTP timeout in seconds (default 60).
 - **`--max-entries`**: maximum lines in the main EDL (default 49999); oldest rows are evicted first when exceeded.
 - **`--expire-days`**: in addition to the size cap, remove structured lines whose comment **`last=`** (UTC calendar date of the most recent run the indicator appeared in the DAG fetch) is at least **N** full days before today. **`0`** disables. Removed lines go to the same expired archive as capacity evictions. Runs **before** `--max-entries` eviction. Verbatim lines without parseable metadata are not age-expired.

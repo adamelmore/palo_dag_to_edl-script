@@ -12,6 +12,8 @@
 # MAX_ENTRIES=49999
 # EXPIRED_OUTPUT=
 # INSECURE=false
+# OUTPUT_BACKUP_COUNT=5   Numbered backups of OUTPUT before each write (0=off); env: PAN_OUTPUT_BACKUP_COUNT if omitted from VAR
+# CA_BUNDLE=   PEM trust bundle for private CA TLS (see --ca-bundle / PAN_SSL_CA_BUNDLE)
 # EXPIRE_DAYS=0
 
 TIMEOUT=60

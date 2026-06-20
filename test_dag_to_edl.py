@@ -258,5 +258,45 @@ class TestAgeExpiration(unittest.TestCase):
         self.assertIn("10.0.0.1", meta)
 
 
+class TestRotateNumberedBackups(unittest.TestCase):
+    def test_no_op_missing_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = str(Path(td) / "missing.txt")
+            m.rotate_numbered_backups(p, 5)
+            self.assertFalse((Path(td) / "missing.txt").exists())
+
+    def test_no_op_zero_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "out.txt"
+            p.write_text("a\n", encoding="utf-8")
+            m.rotate_numbered_backups(str(p), 0)
+            self.assertEqual(p.read_text(encoding="utf-8"), "a\n")
+
+    def test_rotates_chain(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "out.txt"
+            p.write_text("current\n", encoding="utf-8")
+            (Path(td) / "out.txt.1").write_text("one\n", encoding="utf-8")
+            m.rotate_numbered_backups(str(p), 3)
+            self.assertFalse(p.exists())
+            self.assertEqual(
+                (Path(td) / "out.txt.1").read_text(encoding="utf-8"), "current\n"
+            )
+            self.assertEqual((Path(td) / "out.txt.2").read_text(encoding="utf-8"), "one\n")
+            self.assertFalse((Path(td) / "out.txt.3").exists())
+
+    def test_drops_oldest_at_max(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "out.txt"
+            p.write_text("new\n", encoding="utf-8")
+            for i, content in [(1, "a\n"), (2, "b\n"), (3, "c\n")]:
+                (Path(td) / f"out.txt.{i}").write_text(content, encoding="utf-8")
+            m.rotate_numbered_backups(str(p), 3)
+            self.assertEqual((Path(td) / "out.txt.1").read_text(encoding="utf-8"), "new\n")
+            self.assertEqual((Path(td) / "out.txt.2").read_text(encoding="utf-8"), "a\n")
+            self.assertEqual((Path(td) / "out.txt.3").read_text(encoding="utf-8"), "b\n")
+            self.assertFalse((Path(td) / "out.txt.4").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

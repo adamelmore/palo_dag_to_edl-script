@@ -133,9 +133,16 @@ def var_settings_to_arg_defaults(
         d["expired_output"] = eo if eo else None
     if "INSECURE" in var and str(var["INSECURE"]).strip():
         d["insecure"] = _parse_bool_var(str(var["INSECURE"]))
+    if "CA_BUNDLE" in var and str(var["CA_BUNDLE"]).strip():
+        d["ca_bundle"] = str(var["CA_BUNDLE"]).strip()
     if "EXPIRE_DAYS" in var and str(var["EXPIRE_DAYS"]).strip():
         try:
             d["expire_days"] = int(str(var["EXPIRE_DAYS"]).strip(), 10)
+        except ValueError:
+            pass
+    if "OUTPUT_BACKUP_COUNT" in var and str(var["OUTPUT_BACKUP_COUNT"]).strip():
+        try:
+            d["backup_count"] = int(str(var["OUTPUT_BACKUP_COUNT"]).strip(), 10)
         except ValueError:
             pass
     return d
@@ -506,6 +513,19 @@ def iter_member_names(result_el: Optional[ET.Element]) -> Iterator[str]:
                 yield name
 
 
+def resolve_requests_verify(
+    insecure: bool,
+    ca_bundle: Optional[str],
+) -> Union[bool, str]:
+    """Value for ``requests`` *verify*: ``False``, ``True``, or a path to a CA bundle PEM."""
+    if insecure:
+        return False
+    path = (ca_bundle or "").strip()
+    if path:
+        return path
+    return True
+
+
 def parse_dag_op_xml(xml_text: str) -> Tuple[str, List[str]]:
     """
     Returns (status, member_names). status is 'success' or 'error'.
@@ -535,7 +555,7 @@ def fetch_dag_members(
     api_key: str,
     group_name: str,
     vsys: str,
-    verify: bool,
+    verify: Union[bool, str],
     timeout: float,
 ) -> List[str]:
     """GET dynamic-address-group members for one group name."""
@@ -569,7 +589,7 @@ def build_fetch_map(
     base_url: str,
     api_key: str,
     vsys: str,
-    verify: bool,
+    verify: Union[bool, str],
     timeout: float,
 ) -> Dict[str, Set[str]]:
     """
@@ -660,6 +680,31 @@ def write_edl_atomic(
         raise
 
 
+def rotate_numbered_backups(path: str, max_keep: int) -> None:
+    """
+    Before replacing *path*, retain up to *max_keep* rotated copies ``path.1`` …
+    ``path.{max_keep}`` (logrotate-style: current becomes ``.1``, prior ``.1``
+    becomes ``.2``, oldest is dropped).
+
+    No-op when *max_keep* <= 0, when *path* does not exist, or when *path* is not
+    a regular file.
+    """
+    if max_keep <= 0:
+        return
+    ap = os.path.abspath(path)
+    if not os.path.isfile(ap):
+        return
+    oldest = f"{ap}.{max_keep}"
+    if os.path.isfile(oldest):
+        os.remove(oldest)
+    for i in range(max_keep - 1, 0, -1):
+        src = f"{ap}.{i}"
+        dst = f"{ap}.{i + 1}"
+        if os.path.isfile(src):
+            os.replace(src, dst)
+    os.replace(ap, f"{ap}.1")
+
+
 def parse_args(
     argv: Optional[List[str]] = None,
 ) -> Tuple[argparse.Namespace, Dict[str, Union[str, List[str]]]]:
@@ -684,11 +729,32 @@ def parse_args(
         "max_entries": MAX_EDL_ENTRIES_DEFAULT,
         "expired_output": None,
         "insecure": False,
+        "ca_bundle": None,
         "expire_days": 0,
         "host": None,
         "output": None,
+        "backup_count": None,
     }
     runtime_defaults.update(var_arg_defaults)
+    if runtime_defaults.get("backup_count") is None:
+        ev = os.environ.get("PAN_OUTPUT_BACKUP_COUNT", "").strip()
+        if ev:
+            try:
+                runtime_defaults["backup_count"] = int(ev, 10)
+            except ValueError:
+                runtime_defaults["backup_count"] = 5
+        else:
+            runtime_defaults["backup_count"] = 5
+    if not (runtime_defaults.get("ca_bundle") or "").strip():
+        for env_key in (
+            "PAN_SSL_CA_BUNDLE",
+            "REQUESTS_CA_BUNDLE",
+            "SSL_CERT_FILE",
+        ):
+            ev = os.environ.get(env_key, "").strip()
+            if ev:
+                runtime_defaults["ca_bundle"] = ev
+                break
 
     p = argparse.ArgumentParser(
         description=(
@@ -700,7 +766,8 @@ def parse_args(
             f"VAR files: default is {DEFAULT_VAR_BASENAME} next to this script "
             f"({default_var_file_path()}). Syntax: KEY=value lines; # comments. "
             "Keys: HOST, API_KEY, VSYS, GROUP (repeat per group), OUTPUT, TIMEOUT, "
-            "MAX_ENTRIES, EXPIRED_OUTPUT, INSECURE, EXPIRE_DAYS."
+            "MAX_ENTRIES, EXPIRED_OUTPUT, INSECURE, CA_BUNDLE, EXPIRE_DAYS, "
+            "OUTPUT_BACKUP_COUNT."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -737,6 +804,16 @@ def parse_args(
         help="Disable TLS certificate verification (lab use only; VAR: INSECURE)",
     )
     p.add_argument(
+        "--ca-bundle",
+        metavar="PATH",
+        dest="ca_bundle",
+        help=(
+            "PEM file of CA certificate(s) to trust for HTTPS (private CA). "
+            "Ignored when --insecure is set. VAR: CA_BUNDLE. Env (if VAR unset): "
+            "PAN_SSL_CA_BUNDLE, REQUESTS_CA_BUNDLE, SSL_CERT_FILE."
+        ),
+    )
+    p.add_argument(
         "--timeout",
         type=float,
         help="HTTP timeout seconds (VAR: TIMEOUT)",
@@ -768,6 +845,17 @@ def parse_args(
         help=(
             "Unlimited archive for evicted lines (VAR: EXPIRED_OUTPUT; default: "
             "<output> with '.expired' before the extension)"
+        ),
+    )
+    p.add_argument(
+        "--backup-count",
+        type=int,
+        metavar="N",
+        dest="backup_count",
+        help=(
+            "If the output file exists, rotate numbered backups path.1 … path.N "
+            "before writing (0 disables). Default 5; VAR: OUTPUT_BACKUP_COUNT; "
+            "env: PAN_OUTPUT_BACKUP_COUNT (used when VAR omits it)."
         ),
     )
     args = p.parse_args(argv_rest)
@@ -828,12 +916,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     if expire_days < 0:
         expire_days = 0
 
+    backup_count = int(args.backup_count)
+    if backup_count < 0:
+        print(
+            "error: --backup-count / OUTPUT_BACKUP_COUNT must be >= 0",
+            file=sys.stderr,
+        )
+        return 2
+
     lines = load_edl_lines(args.output)
     existing, verbatim, file_warns = parse_edl_file(lines)
     for w in file_warns:
         print(f"warning: {w}", file=sys.stderr)
 
-    verify = not args.insecure
+    ca_path = (getattr(args, "ca_bundle", None) or "").strip()
+    if ca_path and not args.insecure and not os.path.isfile(ca_path):
+        print(
+            f"error: CA bundle is not a readable file: {ca_path}",
+            file=sys.stderr,
+        )
+        return 2
+
+    verify = resolve_requests_verify(bool(args.insecure), ca_path or None)
     today = utc_today()
 
     try:
@@ -884,8 +988,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if expired_new:
         merge_and_write_expired_archive(expired_path, expired_new)
 
+    out_path = str(args.output).strip()
+    try:
+        rotate_numbered_backups(out_path, backup_count)
+    except OSError as e:
+        print(f"error: could not rotate output backups: {e}", file=sys.stderr)
+        return 1
+
     write_edl_atomic(
-        str(args.output).strip(),
+        out_path,
         merged_m,
         verbatim_m,
         fetched_keys,
