@@ -135,6 +135,93 @@ class TestWriteAtomic(unittest.TestCase):
             self.assertTrue(text.endswith("\n") or len(text) > 0)
 
 
+class TestRunSummary(unittest.TestCase):
+    def test_build_run_summary_counts(self):
+        initial_meta = {
+            "10.0.0.1": m.EntryMeta(
+                dag="G", orig="2026-01-01", last="2026-01-01", cnt=1
+            ),
+            "10.0.0.2": m.EntryMeta(
+                dag="G", orig="2026-02-01", last="2026-02-01", cnt=1
+            ),
+        }
+        initial_verbatim = {"10.0.0.9": "10.0.0.9 no-meta"}
+        final_meta = {
+            "10.0.0.2": m.EntryMeta(
+                dag="G", orig="2026-02-01", last="2026-06-24", cnt=2
+            ),
+            "10.0.0.3": m.EntryMeta(
+                dag="G", orig="2026-06-24", last="2026-06-24", cnt=1
+            ),
+        }
+        summary = m.build_run_summary(
+            initial_meta=initial_meta,
+            initial_verbatim=initial_verbatim,
+            final_meta=final_meta,
+            final_verbatim={},
+            final_ordered_keys=["10.0.0.2", "10.0.0.3"],
+            fetched_keys={"10.0.0.2", "10.0.0.3"},
+            member_to_groups={
+                "10.0.0.2": {"G1"},
+                "10.0.0.3": {"G1", "G2"},
+            },
+            groups=["G1", "G2"],
+            expired_age_lines=[
+                "10.0.0.1 # dag=G|orig=2026-01-01|last=2026-01-01|cnt=1|rem=2026-06-24"
+            ],
+            expired_capacity_lines=[],
+            max_entries=100,
+            today="2026-06-24",
+        )
+        self.assertEqual(summary.added, 1)
+        self.assertEqual(summary.removed_age, 1)
+        self.assertEqual(summary.removed_capacity, 0)
+        self.assertEqual(summary.total, 2)
+        self.assertEqual(summary.refreshed, 1)
+        self.assertEqual(summary.stale, 0)
+        self.assertEqual(summary.dag_fetched, 2)
+        self.assertEqual(summary.unchanged, 1)
+        self.assertEqual(summary.per_group_counts["G1"], 2)
+        self.assertEqual(summary.per_group_counts["G2"], 1)
+        self.assertEqual(summary.multi_group_indicators, ["10.0.0.3"])
+        self.assertEqual(summary.cnt_histogram, {1: 1, 2: 1})
+
+    def test_stale_and_verbatim_counts(self):
+        final_meta = {
+            "10.0.0.1": m.EntryMeta(
+                dag="G", orig="2026-01-01", last="2026-05-01", cnt=2
+            ),
+        }
+        summary = m.build_run_summary(
+            initial_meta=final_meta,
+            initial_verbatim={"10.0.0.9": "10.0.0.9 legacy"},
+            final_meta=final_meta,
+            final_verbatim={"10.0.0.9": "10.0.0.9 legacy"},
+            final_ordered_keys=["10.0.0.1", "10.0.0.9"],
+            fetched_keys=set(),
+            member_to_groups={},
+            groups=["G"],
+            expired_age_lines=[],
+            expired_capacity_lines=[],
+            max_entries=100,
+            today="2026-06-24",
+        )
+        self.assertEqual(summary.stale, 2)
+        self.assertEqual(summary.verbatim, 1)
+        self.assertEqual(summary.stale_age_buckets["31-90d"], 1)
+        self.assertEqual(summary.stale_age_buckets["verbatim"], 1)
+
+    def test_indicators_from_expired_lines(self):
+        lines = [
+            "10.0.0.1 # dag=G|orig=2026-01-01|last=2026-01-01|cnt=1|rem=2026-06-24",
+            "10.0.0.2 legacy |rem=2026-06-24",
+        ]
+        self.assertEqual(
+            m.indicators_from_expired_lines(lines),
+            ["10.0.0.1", "10.0.0.2"],
+        )
+
+
 class TestOutputOrder(unittest.TestCase):
     def test_oldest_orig_first_then_verbatim(self):
         meta = {

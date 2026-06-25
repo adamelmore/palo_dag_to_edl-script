@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -291,6 +292,216 @@ def output_keys_ordered(
     return list(meta_keys) + list(verbatim_only)
 
 
+def edl_indicator_keys(
+    meta_by_indicator: Mapping[str, EntryMeta],
+    verbatim_by_indicator: Mapping[str, str],
+) -> Set[str]:
+    return set(meta_by_indicator) | set(verbatim_by_indicator)
+
+
+@dataclass
+class RunSummary:
+    dag_fetched: int
+    refreshed: int
+    added: int
+    stale: int
+    removed_age: int
+    removed_capacity: int
+    verbatim: int
+    total: int
+    max_entries: int
+    expired_archived: int
+    unchanged: int
+    per_group_counts: Dict[str, int]
+    added_indicators: List[str]
+    removed_age_indicators: List[str]
+    removed_capacity_indicators: List[str]
+    stale_indicators: List[str]
+    multi_group_indicators: List[str]
+    cnt_histogram: Dict[int, int]
+    stale_age_buckets: Dict[str, int]
+
+
+def indicators_from_expired_lines(lines: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    for line in lines:
+        ind, _ = split_edl_line(line if line.endswith("\n") else line + "\n")
+        if ind:
+            out.append(ind)
+    return sorted(out)
+
+
+def per_group_member_counts(
+    groups: List[str],
+    member_to_groups: Mapping[str, Set[str]],
+) -> Dict[str, int]:
+    return {
+        g: sum(1 for member_groups in member_to_groups.values() if g in member_groups)
+        for g in groups
+    }
+
+
+def stale_age_bucket_label(days: int) -> str:
+    if days <= 7:
+        return "0-7d"
+    if days <= 30:
+        return "8-30d"
+    if days <= 90:
+        return "31-90d"
+    return "91d+"
+
+
+def build_stale_age_buckets(
+    stale_indicators: Iterable[str],
+    final_meta: Mapping[str, EntryMeta],
+    final_verbatim: Mapping[str, str],
+    today: str,
+) -> Dict[str, int]:
+    buckets = {"0-7d": 0, "8-30d": 0, "31-90d": 0, "91d+": 0, "verbatim": 0}
+    try:
+        today_d = date.fromisoformat(today)
+    except ValueError:
+        return buckets
+    for ind in stale_indicators:
+        if ind in final_verbatim and ind not in final_meta:
+            buckets["verbatim"] += 1
+            continue
+        meta = final_meta.get(ind)
+        if meta is None:
+            continue
+        try:
+            last_d = date.fromisoformat(meta.last)
+        except ValueError:
+            continue
+        buckets[stale_age_bucket_label((today_d - last_d).days)] += 1
+    return buckets
+
+
+def build_run_summary(
+    *,
+    initial_meta: Mapping[str, EntryMeta],
+    initial_verbatim: Mapping[str, str],
+    final_meta: Mapping[str, EntryMeta],
+    final_verbatim: Mapping[str, str],
+    final_ordered_keys: List[str],
+    fetched_keys: Set[str],
+    member_to_groups: Mapping[str, Set[str]],
+    groups: List[str],
+    expired_age_lines: List[str],
+    expired_capacity_lines: List[str],
+    max_entries: int,
+    today: str,
+) -> RunSummary:
+    initial = edl_indicator_keys(initial_meta, initial_verbatim)
+    final = set(final_ordered_keys)
+    added_indicators = sorted(final - initial)
+    stale_indicators = sorted(final - fetched_keys)
+    refreshed = len(set(initial_meta.keys()) & fetched_keys & final)
+    verbatim = sum(
+        1
+        for k in final_ordered_keys
+        if k in final_verbatim and k not in final_meta
+    )
+    if max_entries < 1:
+        max_entries = MAX_EDL_ENTRIES_DEFAULT
+    return RunSummary(
+        dag_fetched=len(fetched_keys),
+        refreshed=refreshed,
+        added=len(added_indicators),
+        stale=len(stale_indicators),
+        removed_age=len(expired_age_lines),
+        removed_capacity=len(expired_capacity_lines),
+        verbatim=verbatim,
+        total=len(final_ordered_keys),
+        max_entries=max_entries,
+        expired_archived=len(expired_age_lines) + len(expired_capacity_lines),
+        unchanged=len(initial & final),
+        per_group_counts=per_group_member_counts(groups, member_to_groups),
+        added_indicators=added_indicators,
+        removed_age_indicators=indicators_from_expired_lines(expired_age_lines),
+        removed_capacity_indicators=indicators_from_expired_lines(
+            expired_capacity_lines
+        ),
+        stale_indicators=stale_indicators,
+        multi_group_indicators=sorted(
+            m for m, gs in member_to_groups.items() if len(gs) > 1
+        ),
+        cnt_histogram={
+            c: sum(1 for k in final_ordered_keys if k in final_meta and final_meta[k].cnt == c)
+            for c in sorted({final_meta[k].cnt for k in final_ordered_keys if k in final_meta})
+        },
+        stale_age_buckets=build_stale_age_buckets(
+            stale_indicators, final_meta, final_verbatim, today
+        ),
+    )
+
+
+def _print_indicator_list(label: str, indicators: List[str]) -> None:
+    print(f"{label} ({len(indicators)}):", file=sys.stderr)
+    for ind in indicators:
+        print(f"  {ind}", file=sys.stderr)
+
+
+def print_run_summary(
+    summary: RunSummary,
+    *,
+    verbose: bool,
+    today: str,
+    vsys: str,
+    output_path: str,
+    elapsed_seconds: float,
+) -> None:
+    removed_total = summary.removed_age + summary.removed_capacity
+    headroom = max(summary.max_entries - summary.total, 0)
+    print(
+        f"dag fetched: {summary.dag_fetched}, refreshed: {summary.refreshed}, "
+        f"added: {summary.added}, stale: {summary.stale}, "
+        f"removed: {removed_total} (age: {summary.removed_age}, "
+        f"capacity: {summary.removed_capacity}), verbatim: {summary.verbatim}, "
+        f"total: {summary.total}/{summary.max_entries} (headroom: {headroom}), "
+        f"expired archived: {summary.expired_archived}",
+        file=sys.stderr,
+    )
+    if summary.per_group_counts:
+        group_parts = ", ".join(
+            f"{name}={count}" for name, count in summary.per_group_counts.items()
+        )
+        print(
+            f"groups: {group_parts} (unique merged: {summary.dag_fetched})",
+            file=sys.stderr,
+        )
+    print(
+        f"unchanged: {summary.unchanged}, run date: {today}, vsys: {vsys}, "
+        f"output: {output_path}, elapsed: {elapsed_seconds:.2f}s",
+        file=sys.stderr,
+    )
+    if not verbose:
+        return
+    print(
+        f"multi-group indicators: {len(summary.multi_group_indicators)}",
+        file=sys.stderr,
+    )
+    if summary.cnt_histogram:
+        hist = ", ".join(
+            f"cnt={cnt}:{count}"
+            for cnt, count in sorted(summary.cnt_histogram.items())
+        )
+        print(f"cnt histogram: {hist}", file=sys.stderr)
+    bucket_parts = ", ".join(
+        f"{label}={count}"
+        for label, count in summary.stale_age_buckets.items()
+        if count
+    )
+    if bucket_parts:
+        print(f"stale age distribution: {bucket_parts}", file=sys.stderr)
+    if summary.multi_group_indicators:
+        _print_indicator_list("multi-group", summary.multi_group_indicators)
+    _print_indicator_list("added", summary.added_indicators)
+    _print_indicator_list("removed (age)", summary.removed_age_indicators)
+    _print_indicator_list("removed (capacity)", summary.removed_capacity_indicators)
+    _print_indicator_list("stale", summary.stale_indicators)
+
+
 def extract_removal_date(line: str) -> str:
     """Parse |rem=YYYY-MM-DD from an expired-archive line; missing -> sort last."""
     m = re.search(r"\|rem=(\d{4}-\d{2}-\d{2})\s*$", line.rstrip())
@@ -519,6 +730,9 @@ def resolve_requests_verify(
 ) -> Union[bool, str]:
     """Value for ``requests`` *verify*: ``False``, ``True``, or a path to a CA bundle PEM."""
     if insecure:
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         return False
     path = (ca_bundle or "").strip()
     if path:
@@ -858,6 +1072,14 @@ def parse_args(
             "env: PAN_OUTPUT_BACKUP_COUNT (used when VAR omits it)."
         ),
     )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Print detailed run metrics: per-indicator lists, multi-group overlap, "
+            "cnt histogram, and stale age distribution."
+        ),
+    )
     args = p.parse_args(argv_rest)
 
     return args, merged_var
@@ -939,6 +1161,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     verify = resolve_requests_verify(bool(args.insecure), ca_path or None)
     today = utc_today()
+    run_started = time.perf_counter()
 
     try:
         member_to_groups = build_fetch_map(
@@ -963,15 +1186,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     verbatim_m = dict(verbatim)
     expired_new: List[str] = []
 
-    expired_new.extend(
-        apply_age_expiration(
-            merged_m,
-            verbatim_m,
-            expire_days,
-            today,
-            today,
-        )
+    expired_age = apply_age_expiration(
+        merged_m,
+        verbatim_m,
+        expire_days,
+        today,
+        today,
     )
+    expired_new.extend(expired_age)
 
     ordered_after, expired_cap = apply_max_entry_eviction(
         merged_m,
@@ -981,6 +1203,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         today,
     )
     expired_new.extend(expired_cap)
+
+    max_entries = int(args.max_entries)
+    if max_entries < 1:
+        max_entries = MAX_EDL_ENTRIES_DEFAULT
 
     expired_path = args.expired_output or default_expired_output_path(
         str(args.output).strip()
@@ -1001,6 +1227,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         verbatim_m,
         fetched_keys,
         ordered_keys=ordered_after,
+    )
+    summary = build_run_summary(
+        initial_meta=existing,
+        initial_verbatim=verbatim,
+        final_meta=merged_m,
+        final_verbatim=verbatim_m,
+        final_ordered_keys=ordered_after,
+        fetched_keys=fetched_keys,
+        member_to_groups=member_to_groups,
+        groups=groups,
+        expired_age_lines=expired_age,
+        expired_capacity_lines=expired_cap,
+        max_entries=max_entries,
+        today=today,
+    )
+    print_run_summary(
+        summary,
+        verbose=bool(args.verbose),
+        today=today,
+        vsys=str(args.vsys),
+        output_path=out_path,
+        elapsed_seconds=time.perf_counter() - run_started,
     )
     return 0
 
