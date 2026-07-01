@@ -345,6 +345,191 @@ class TestAgeExpiration(unittest.TestCase):
         self.assertIn("10.0.0.1", meta)
 
 
+class TestSubnetSummarization(unittest.TestCase):
+    def _host_meta(self, host: str, **kwargs) -> m.EntryMeta:
+        defaults = dict(dag="G", orig="2026-01-01", last="2026-06-01", cnt=1)
+        defaults.update(kwargs)
+        return m.EntryMeta(**defaults)
+
+    def test_threshold_met_summarizes_hosts(self):
+        meta = {
+            f"10.0.1.{i}": self._host_meta(f"10.0.1.{i}")
+            for i in range(1, 6)
+        }
+        verbatim: dict = {}
+        ordered, stats = m.apply_subnet_summarization(
+            meta,
+            verbatim,
+            set(meta),
+            list(meta.keys()),
+            enabled=True,
+            min_hosts=5,
+            prefix=24,
+            report_only=False,
+        )
+        self.assertEqual(stats.hosts_collapsed, 5)
+        self.assertEqual(stats.cidr_created, 1)
+        self.assertIn("10.0.1.0/24", meta)
+        self.assertEqual(len(meta), 1)
+        self.assertEqual(ordered, ["10.0.1.0/24"])
+
+    def test_below_threshold_unchanged(self):
+        meta = {
+            f"10.0.1.{i}": self._host_meta(f"10.0.1.{i}")
+            for i in range(1, 5)
+        }
+        verbatim: dict = {}
+        before = dict(meta)
+        ordered, stats = m.apply_subnet_summarization(
+            meta,
+            verbatim,
+            set(meta),
+            sorted(meta.keys()),
+            enabled=True,
+            min_hosts=5,
+            prefix=24,
+            report_only=False,
+        )
+        self.assertEqual(stats.hosts_collapsed, 0)
+        self.assertEqual(meta, before)
+        self.assertEqual(len(ordered), 4)
+
+    def test_metadata_merge_on_summarize(self):
+        meta = {
+            "10.0.1.1": m.EntryMeta(
+                dag="B", orig="2026-01-15", last="2026-06-01", cnt=2
+            ),
+            "10.0.1.2": m.EntryMeta(
+                dag="A", orig="2026-01-01", last="2026-06-15", cnt=3
+            ),
+            "10.0.1.3": m.EntryMeta(
+                dag="C", orig="2026-02-01", last="2026-05-01", cnt=1
+            ),
+            "10.0.1.4": m.EntryMeta(
+                dag="A", orig="2026-03-01", last="2026-04-01", cnt=1
+            ),
+            "10.0.1.5": m.EntryMeta(
+                dag="D", orig="2026-04-01", last="2026-03-01", cnt=1
+            ),
+        }
+        verbatim: dict = {}
+        m.apply_subnet_summarization(
+            meta,
+            verbatim,
+            set(meta),
+            sorted(meta.keys()),
+            enabled=True,
+            min_hosts=5,
+            prefix=24,
+            report_only=False,
+        )
+        merged = meta["10.0.1.0/24"]
+        self.assertEqual(merged.dag, "A")
+        self.assertEqual(merged.orig, "2026-01-01")
+        self.assertEqual(merged.last, "2026-06-15")
+        self.assertEqual(merged.cnt, 8)
+
+    def test_existing_cidr_absorbs_covered_hosts(self):
+        meta = {
+            "10.0.1.0/24": m.EntryMeta(
+                dag="G", orig="2026-01-01", last="2026-06-01", cnt=2
+            ),
+            "10.0.1.1": m.EntryMeta(
+                dag="G", orig="2026-02-01", last="2026-06-02", cnt=1
+            ),
+            "10.0.1.2": m.EntryMeta(
+                dag="G", orig="2026-03-01", last="2026-06-03", cnt=1
+            ),
+            "10.0.1.3": m.EntryMeta(
+                dag="G", orig="2026-04-01", last="2026-06-04", cnt=1
+            ),
+        }
+        verbatim: dict = {}
+        m.apply_subnet_summarization(
+            meta,
+            verbatim,
+            set(meta),
+            sorted(meta.keys()),
+            enabled=True,
+            min_hosts=5,
+            prefix=24,
+            report_only=False,
+        )
+        self.assertEqual(set(meta.keys()), {"10.0.1.0/24"})
+        self.assertEqual(meta["10.0.1.0/24"].orig, "2026-01-01")
+        self.assertEqual(meta["10.0.1.0/24"].last, "2026-06-04")
+        self.assertEqual(meta["10.0.1.0/24"].cnt, 5)
+
+    def test_report_only_does_not_mutate(self):
+        meta = {
+            f"10.0.1.{i}": self._host_meta(f"10.0.1.{i}")
+            for i in range(1, 6)
+        }
+        before = {k: m.EntryMeta(**vars(v)) for k, v in meta.items()}
+        verbatim: dict = {}
+        ordered_before = sorted(meta.keys())
+        ordered, stats = m.apply_subnet_summarization(
+            meta,
+            verbatim,
+            set(meta),
+            ordered_before,
+            enabled=True,
+            min_hosts=5,
+            prefix=24,
+            report_only=True,
+        )
+        self.assertEqual(meta, before)
+        self.assertEqual(ordered, ordered_before)
+        self.assertTrue(stats.report_only)
+        self.assertEqual(stats.hosts_collapsed, 5)
+        self.assertEqual(stats.entries_before, stats.entries_after)
+
+    def test_disabled_skips_pass(self):
+        meta = {
+            f"10.0.1.{i}": self._host_meta(f"10.0.1.{i}")
+            for i in range(1, 6)
+        }
+        verbatim: dict = {}
+        ordered, stats = m.apply_subnet_summarization(
+            meta,
+            verbatim,
+            set(meta),
+            sorted(meta.keys()),
+            enabled=False,
+            min_hosts=5,
+            prefix=24,
+            report_only=False,
+        )
+        self.assertFalse(stats.enabled)
+        self.assertEqual(len(meta), 5)
+
+    def test_ordering_uses_merged_orig(self):
+        meta = {
+            "10.0.2.5": m.EntryMeta(
+                dag="G", orig="2026-05-01", last="2026-06-01", cnt=1
+            ),
+            **{
+                f"10.0.1.{i}": m.EntryMeta(
+                    dag="G", orig="2026-01-01", last="2026-06-01", cnt=1
+                )
+                for i in range(1, 6)
+            },
+        }
+        verbatim: dict = {}
+        ordered, _ = m.apply_subnet_summarization(
+            meta,
+            verbatim,
+            set(meta),
+            sorted(meta.keys()),
+            enabled=True,
+            min_hosts=5,
+            prefix=24,
+            report_only=False,
+        )
+        self.assertEqual(ordered[0], "10.0.1.0/24")
+        self.assertEqual(ordered[1], "10.0.2.5")
+
+
 class TestRotateNumberedBackups(unittest.TestCase):
     def test_no_op_missing_file(self):
         with tempfile.TemporaryDirectory() as td:

@@ -43,6 +43,10 @@ Supported keys (CLI flags override merged VAR when you pass them explicitly):
 | `CA_BUNDLE` | `--ca-bundle` (path to PEM file trusted for HTTPS when using a private CA) |
 | `OUTPUT_BACKUP_COUNT` | `--backup-count` (integer; `0` disables numbered backups before each write; default **5**) |
 | `EXPIRE_DAYS` | `--expire-days` (integer; `0` disables age expiry) |
+| `SUMMARIZE` | `--no-summarize` to disable (default **on**; `true` / `false` in VAR) |
+| `SUMMARIZE_MIN_HOSTS` | `--summarize-min-hosts` (default **5**; env: `PAN_SUMMARIZE_MIN_HOSTS` when VAR omits it) |
+| `SUMMARIZE_PREFIX` | `--summarize-prefix` (default **24**; env: `PAN_SUMMARIZE_PREFIX` when VAR omits it) |
+| `SUMMARIZE_REPORT_ONLY` | `--summarize-report-only` (analyze only; env: `PAN_SUMMARIZE_REPORT_ONLY` when VAR omits it) |
 
 If you use **`--group`** on the command line, **only** those groups are used for that run (VAR `GROUP` lines are ignored). If you omit **`--group`**, groups must come from **`GROUP=`** in the merged VAR files.
 
@@ -56,6 +60,21 @@ If you use **`--group`** on the command line, **only** those groups are used for
 - **`--max-entries`**: maximum lines in the main EDL (default 49999); oldest rows are evicted first when exceeded.
 - **`--expire-days`**: in addition to the size cap, remove structured lines whose comment **`last=`** (UTC calendar date of the most recent run the indicator appeared in the DAG fetch) is at least **N** full days before today. **`0`** disables. Removed lines go to the same expired archive as capacity evictions. Runs **before** `--max-entries` eviction. Verbatim lines without parseable metadata are not age-expired.
 - **`--expired-output`**: path to the unlimited expired-lines archive (default: same directory as `--output`, with `.expired` before the extension, e.g. `edl.txt` → `edl.expired.txt`).
+- **`--no-summarize`**: disable IPv4 subnet summarization (enabled by default). VAR: `SUMMARIZE=false`.
+- **`--summarize-min-hosts`**: when at least **N** standalone IPv4 host entries fall within the same `/prefix` bucket, replace them with one summarized CIDR (default **5**). VAR: `SUMMARIZE_MIN_HOSTS`. Env: `PAN_SUMMARIZE_MIN_HOSTS` when VAR omits it.
+- **`--summarize-prefix`**: subnet boundary used for grouping and for the output CIDR (default **24**). VAR: `SUMMARIZE_PREFIX`. Env: `PAN_SUMMARIZE_PREFIX` when VAR omits it.
+- **`--summarize-report-only`**: run summarization analysis and print metrics without modifying the EDL file. VAR: `SUMMARIZE_REPORT_ONLY=true`. Env: `PAN_SUMMARIZE_REPORT_ONLY` when VAR omits it.
+- **`--verbose`**: include per-subnet summarization detail, near-miss buckets, and other extended metrics on stderr.
+
+## Subnet summarization
+
+After merge, age expiry, and capacity eviction, the script runs an **IPv4 subnet summarization** pass (unless disabled). Standalone host IPs in the same `/prefix` bucket (default `/24`) are grouped; when a bucket has at least **`SUMMARIZE_MIN_HOSTS`** entries (default **5**), those hosts are replaced by a single **`network/prefix`** CIDR line. Host entries already covered by an existing CIDR in the list are removed and their metadata is merged into that CIDR even when the bucket is below the threshold.
+
+Comment metadata on summarized CIDRs uses the same rules as multi-group merge: `dag` = lexicographic minimum, `orig` = oldest, `last` = newest, `cnt` = sum of merged entries.
+
+Summarization metrics are always printed on stderr when enabled (entry count before/after, hosts collapsed, CIDRs created/merged). Use **`--verbose`** for per-subnet host lists and near-miss buckets (subnets with 2..N-1 hosts). Use **`--summarize-report-only`** to preview without writing changes.
+
+IPv6, range strings, and non-IP indicators are left unchanged. Summarized hosts are not written to the expired archive.
 
 ## Size limit and expired archive
 

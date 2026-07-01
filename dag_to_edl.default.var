@@ -15,9 +15,17 @@
 # OUTPUT_BACKUP_COUNT=5   Numbered backups of OUTPUT before each write (0=off); env: PAN_OUTPUT_BACKUP_COUNT if omitted from VAR
 # CA_BUNDLE=   PEM trust bundle for private CA TLS (see --ca-bundle / PAN_SSL_CA_BUNDLE)
 # EXPIRE_DAYS=0
+# SUMMARIZE=true           Enable IPv4 subnet summarization (default on; use false or --no-summarize to disable)
+# SUMMARIZE_MIN_HOSTS=5    Minimum host IPs in the same /prefix bucket to summarize (env: PAN_SUMMARIZE_MIN_HOSTS)
+# SUMMARIZE_PREFIX=24      Subnet prefix for grouping and summarized CIDR output (env: PAN_SUMMARIZE_PREFIX)
+# SUMMARIZE_REPORT_ONLY=false   Analyze only; do not modify the EDL (env: PAN_SUMMARIZE_REPORT_ONLY)
 
 TIMEOUT=60
 MAX_ENTRIES=49999
 VSYS=vsys1
 INSECURE=false
 EXPIRE_DAYS=0
+SUMMARIZE=true
+SUMMARIZE_MIN_HOSTS=5
+SUMMARIZE_PREFIX=24
+SUMMARIZE_REPORT_ONLY=false

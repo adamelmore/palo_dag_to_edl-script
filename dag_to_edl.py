@@ -9,6 +9,7 @@ Uses PAN-OS XML API operational command:
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 import re
 import sys
@@ -146,6 +147,20 @@ def var_settings_to_arg_defaults(
             d["backup_count"] = int(str(var["OUTPUT_BACKUP_COUNT"]).strip(), 10)
         except ValueError:
             pass
+    if "SUMMARIZE" in var and str(var["SUMMARIZE"]).strip():
+        d["summarize"] = _parse_bool_var(str(var["SUMMARIZE"]))
+    if "SUMMARIZE_MIN_HOSTS" in var and str(var["SUMMARIZE_MIN_HOSTS"]).strip():
+        try:
+            d["summarize_min_hosts"] = int(str(var["SUMMARIZE_MIN_HOSTS"]).strip(), 10)
+        except ValueError:
+            pass
+    if "SUMMARIZE_PREFIX" in var and str(var["SUMMARIZE_PREFIX"]).strip():
+        try:
+            d["summarize_prefix"] = int(str(var["SUMMARIZE_PREFIX"]).strip(), 10)
+        except ValueError:
+            pass
+    if "SUMMARIZE_REPORT_ONLY" in var and str(var["SUMMARIZE_REPORT_ONLY"]).strip():
+        d["summarize_report_only"] = _parse_bool_var(str(var["SUMMARIZE_REPORT_ONLY"]))
     return d
 
 
@@ -299,6 +314,266 @@ def edl_indicator_keys(
     return set(meta_by_indicator) | set(verbatim_by_indicator)
 
 
+def parse_ipv4_host(indicator: str) -> Optional[ipaddress.IPv4Address]:
+    """Return host address when indicator is a plain IPv4 host (not CIDR or range)."""
+    if "/" in indicator or "-" in indicator:
+        return None
+    try:
+        addr = ipaddress.IPv4Address(indicator)
+    except ValueError:
+        return None
+    return addr
+
+
+def parse_ipv4_network(indicator: str) -> Optional[ipaddress.IPv4Network]:
+    """Return IPv4 network when indicator is CIDR notation."""
+    if "/" not in indicator:
+        return None
+    try:
+        net = ipaddress.ip_network(indicator, strict=False)
+    except ValueError:
+        return None
+    if not isinstance(net, ipaddress.IPv4Network):
+        return None
+    return net
+
+
+def normalize_summarize_prefix(prefix: int) -> int:
+    if 8 <= prefix <= 30:
+        return prefix
+    print(
+        f"warning: invalid SUMMARIZE_PREFIX {prefix}; using 24",
+        file=sys.stderr,
+    )
+    return 24
+
+
+def normalize_summarize_min_hosts(min_hosts: int) -> int:
+    if min_hosts < 2:
+        return 2
+    return min_hosts
+
+
+def merge_entry_meta(metas: List[EntryMeta]) -> EntryMeta:
+    return EntryMeta(
+        dag=min(m.dag for m in metas),
+        orig=min(m.orig for m in metas),
+        last=max(m.last for m in metas),
+        cnt=sum(m.cnt for m in metas),
+    )
+
+
+def _ipv4_network_indicators(meta_by_indicator: Mapping[str, EntryMeta]) -> Dict[str, ipaddress.IPv4Network]:
+    out: Dict[str, ipaddress.IPv4Network] = {}
+    for ind in meta_by_indicator:
+        net = parse_ipv4_network(ind)
+        if net is not None and net.prefixlen < 32:
+            out[ind] = net
+    return out
+
+
+def _covering_network_key(
+    host: ipaddress.IPv4Address,
+    networks: Mapping[str, ipaddress.IPv4Network],
+) -> Optional[str]:
+    best_key: Optional[str] = None
+    best_prefix = -1
+    for key, net in networks.items():
+        if host in net and net.prefixlen < 32:
+            if net.prefixlen > best_prefix:
+                best_prefix = net.prefixlen
+                best_key = key
+    return best_key
+
+
+def _supernet_key(host: ipaddress.IPv4Address, prefix: int) -> str:
+    return str(ipaddress.ip_network(f"{host}/{prefix}", strict=False))
+
+
+@dataclass
+class SummarizeStats:
+    enabled: bool
+    report_only: bool
+    prefix: int
+    min_hosts: int
+    hosts_considered: int
+    hosts_skipped: int
+    skipped_covered: int
+    skipped_non_host: int
+    subnets_qualifying: int
+    hosts_collapsed: int
+    cidr_created: int
+    cidr_merged: int
+    entries_before: int
+    entries_after: int
+    qualifying_subnets: List[Tuple[str, List[str]]]
+    near_miss_subnets: List[Tuple[str, List[str]]]
+
+
+def apply_subnet_summarization(
+    meta_by_indicator: Dict[str, EntryMeta],
+    verbatim_by_indicator: Dict[str, str],
+    fetched_indicators: Set[str],
+    ordered_keys: List[str],
+    *,
+    enabled: bool,
+    min_hosts: int,
+    prefix: int,
+    report_only: bool,
+) -> Tuple[List[str], SummarizeStats]:
+    """
+    Group IPv4 host entries within a /prefix boundary and replace qualifying
+    groups with a summarized CIDR. Returns updated ordered keys and stats.
+    """
+    prefix = normalize_summarize_prefix(prefix)
+    min_hosts = normalize_summarize_min_hosts(min_hosts)
+    entries_before = len(ordered_keys)
+
+    empty_stats = SummarizeStats(
+        enabled=enabled,
+        report_only=report_only,
+        prefix=prefix,
+        min_hosts=min_hosts,
+        hosts_considered=0,
+        hosts_skipped=0,
+        skipped_covered=0,
+        skipped_non_host=0,
+        subnets_qualifying=0,
+        hosts_collapsed=0,
+        cidr_created=0,
+        cidr_merged=0,
+        entries_before=entries_before,
+        entries_after=entries_before,
+        qualifying_subnets=[],
+        near_miss_subnets=[],
+    )
+    if not enabled:
+        empty_stats.enabled = False
+        return ordered_keys, empty_stats
+
+    networks = _ipv4_network_indicators(meta_by_indicator)
+    skipped_covered = 0
+    skipped_non_host = 0
+    hosts_covered_cleanup: List[Tuple[str, str]] = []
+
+    for ind in list(meta_by_indicator.keys()):
+        host = parse_ipv4_host(ind)
+        if host is None:
+            if parse_ipv4_network(ind) is None:
+                skipped_non_host += 1
+            continue
+        cover_key = _covering_network_key(host, networks)
+        if cover_key is None or cover_key == ind:
+            continue
+        skipped_covered += 1
+        hosts_covered_cleanup.append((ind, cover_key))
+
+    buckets: Dict[str, List[str]] = {}
+    hosts_considered = 0
+    covered_hosts = {h for h, _ in hosts_covered_cleanup}
+
+    for ind in meta_by_indicator:
+        if ind in covered_hosts:
+            continue
+        host = parse_ipv4_host(ind)
+        if host is None:
+            if parse_ipv4_network(ind) is None:
+                continue
+            continue
+        hosts_considered += 1
+        bucket = _supernet_key(host, prefix)
+        buckets.setdefault(bucket, []).append(ind)
+
+    qualifying: Dict[str, List[str]] = {}
+    near_miss: Dict[str, List[str]] = {}
+    for bucket, hosts in buckets.items():
+        sorted_hosts = sorted(hosts)
+        if len(hosts) >= min_hosts:
+            qualifying[bucket] = sorted_hosts
+        elif len(hosts) >= 2:
+            near_miss[bucket] = sorted_hosts
+
+    hosts_collapsed = sum(len(h) for h in qualifying.values())
+    cidr_created = 0
+    cidr_merged = 0
+
+    projected_cidr_created = sum(
+        1 for bucket in qualifying if bucket not in meta_by_indicator
+    )
+    projected_cidr_merged = (
+        len({cover for _, cover in hosts_covered_cleanup})
+        + sum(1 for bucket in qualifying if bucket in meta_by_indicator)
+    )
+
+    if not report_only:
+        merged_cover_keys: Set[str] = set()
+        for host_ind, cover_key in hosts_covered_cleanup:
+            if host_ind not in meta_by_indicator:
+                continue
+            merged = merge_entry_meta(
+                [meta_by_indicator[cover_key], meta_by_indicator[host_ind]]
+            )
+            meta_by_indicator[cover_key] = merged
+            del meta_by_indicator[host_ind]
+            verbatim_by_indicator.pop(host_ind, None)
+            merged_cover_keys.add(cover_key)
+
+        cidr_merged = len(merged_cover_keys)
+
+        for bucket, hosts in qualifying.items():
+            metas = [meta_by_indicator[h] for h in hosts]
+            merged = merge_entry_meta(metas)
+            for h in hosts:
+                del meta_by_indicator[h]
+                verbatim_by_indicator.pop(h, None)
+            if bucket in meta_by_indicator:
+                meta_by_indicator[bucket] = merge_entry_meta(
+                    [meta_by_indicator[bucket], merged]
+                )
+                cidr_merged += 1
+            else:
+                meta_by_indicator[bucket] = merged
+                cidr_created += 1
+
+        ordered_keys = output_keys_ordered(
+            meta_by_indicator, verbatim_by_indicator, fetched_indicators
+        )
+
+    entries_after = (
+        entries_before
+        if report_only
+        else len(ordered_keys)
+    )
+
+    qualifying_subnets = sorted(
+        (bucket, hosts) for bucket, hosts in qualifying.items()
+    )
+    near_miss_subnets = sorted(
+        (bucket, hosts) for bucket, hosts in near_miss.items()
+    )
+
+    hosts_skipped = skipped_covered + skipped_non_host
+
+    return ordered_keys, SummarizeStats(
+        enabled=True,
+        report_only=report_only,
+        prefix=prefix,
+        min_hosts=min_hosts,
+        hosts_considered=hosts_considered,
+        hosts_skipped=hosts_skipped,
+        skipped_covered=skipped_covered,
+        skipped_non_host=skipped_non_host,
+        subnets_qualifying=len(qualifying),
+        hosts_collapsed=hosts_collapsed,
+        cidr_created=projected_cidr_created if report_only else cidr_created,
+        cidr_merged=projected_cidr_merged if report_only else cidr_merged,
+        entries_before=entries_before,
+        entries_after=entries_after,
+        qualifying_subnets=qualifying_subnets,
+        near_miss_subnets=near_miss_subnets,
+    )
+
+
 @dataclass
 class RunSummary:
     dag_fetched: int
@@ -320,6 +595,7 @@ class RunSummary:
     multi_group_indicators: List[str]
     cnt_histogram: Dict[int, int]
     stale_age_buckets: Dict[str, int]
+    summarize: Optional[SummarizeStats] = None
 
 
 def indicators_from_expired_lines(lines: Iterable[str]) -> List[str]:
@@ -475,6 +751,21 @@ def print_run_summary(
         f"output: {output_path}, elapsed: {elapsed_seconds:.2f}s",
         file=sys.stderr,
     )
+    if summary.summarize is not None:
+        s = summary.summarize
+        if not s.enabled:
+            print("summarize: disabled", file=sys.stderr)
+        else:
+            cidr_total = s.cidr_created + s.cidr_merged
+            line = (
+                f"summarize: collapsed {s.hosts_collapsed} hosts into "
+                f"{s.cidr_created}+{s.cidr_merged} CIDR(s), "
+                f"entries {s.entries_before}->{s.entries_after} "
+                f"(/{s.prefix}, min={s.min_hosts})"
+            )
+            if s.report_only:
+                line += " (report-only, no file changes)"
+            print(line, file=sys.stderr)
     if not verbose:
         return
     print(
@@ -496,6 +787,36 @@ def print_run_summary(
         print(f"stale age distribution: {bucket_parts}", file=sys.stderr)
     if summary.multi_group_indicators:
         _print_indicator_list("multi-group", summary.multi_group_indicators)
+    if summary.summarize is not None and summary.summarize.enabled:
+        s = summary.summarize
+        if s.skipped_covered or s.skipped_non_host:
+            print(
+                f"summarize skipped: covered-by-CIDR={s.skipped_covered}, "
+                f"non-IPv4-host={s.skipped_non_host}",
+                file=sys.stderr,
+            )
+        if s.qualifying_subnets:
+            print(
+                f"summarize qualifying subnets: {s.subnets_qualifying}",
+                file=sys.stderr,
+            )
+            for bucket, hosts in s.qualifying_subnets:
+                host_list = ", ".join(hosts)
+                print(
+                    f"  {bucket} ({len(hosts)} hosts): {host_list}",
+                    file=sys.stderr,
+                )
+        if s.near_miss_subnets:
+            print(
+                f"summarize near-miss subnets: {len(s.near_miss_subnets)}",
+                file=sys.stderr,
+            )
+            for bucket, hosts in s.near_miss_subnets:
+                host_list = ", ".join(hosts)
+                print(
+                    f"  {bucket} ({len(hosts)} hosts): {host_list}",
+                    file=sys.stderr,
+                )
     _print_indicator_list("added", summary.added_indicators)
     _print_indicator_list("removed (age)", summary.removed_age_indicators)
     _print_indicator_list("removed (capacity)", summary.removed_capacity_indicators)
@@ -948,8 +1269,30 @@ def parse_args(
         "host": None,
         "output": None,
         "backup_count": None,
+        "summarize": True,
+        "summarize_min_hosts": 5,
+        "summarize_prefix": 24,
+        "summarize_report_only": False,
     }
     runtime_defaults.update(var_arg_defaults)
+    if "SUMMARIZE_MIN_HOSTS" not in merged_var:
+        ev = os.environ.get("PAN_SUMMARIZE_MIN_HOSTS", "").strip()
+        if ev:
+            try:
+                runtime_defaults["summarize_min_hosts"] = int(ev, 10)
+            except ValueError:
+                pass
+    if "SUMMARIZE_PREFIX" not in merged_var:
+        ev = os.environ.get("PAN_SUMMARIZE_PREFIX", "").strip()
+        if ev:
+            try:
+                runtime_defaults["summarize_prefix"] = int(ev, 10)
+            except ValueError:
+                pass
+    if "SUMMARIZE_REPORT_ONLY" not in merged_var:
+        ev = os.environ.get("PAN_SUMMARIZE_REPORT_ONLY", "").strip()
+        if ev:
+            runtime_defaults["summarize_report_only"] = _parse_bool_var(ev)
     if runtime_defaults.get("backup_count") is None:
         ev = os.environ.get("PAN_OUTPUT_BACKUP_COUNT", "").strip()
         if ev:
@@ -981,7 +1324,8 @@ def parse_args(
             f"({default_var_file_path()}). Syntax: KEY=value lines; # comments. "
             "Keys: HOST, API_KEY, VSYS, GROUP (repeat per group), OUTPUT, TIMEOUT, "
             "MAX_ENTRIES, EXPIRED_OUTPUT, INSECURE, CA_BUNDLE, EXPIRE_DAYS, "
-            "OUTPUT_BACKUP_COUNT."
+            "OUTPUT_BACKUP_COUNT, SUMMARIZE, SUMMARIZE_MIN_HOSTS, SUMMARIZE_PREFIX, "
+            "SUMMARIZE_REPORT_ONLY."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1077,7 +1421,43 @@ def parse_args(
         action="store_true",
         help=(
             "Print detailed run metrics: per-indicator lists, multi-group overlap, "
-            "cnt histogram, and stale age distribution."
+            "cnt histogram, stale age distribution, and summarization detail."
+        ),
+    )
+    p.add_argument(
+        "--no-summarize",
+        action="store_false",
+        dest="summarize",
+        help="Disable IPv4 subnet summarization (VAR: SUMMARIZE=false)",
+    )
+    p.add_argument(
+        "--summarize-min-hosts",
+        type=int,
+        metavar="N",
+        dest="summarize_min_hosts",
+        help=(
+            "Minimum host IPs in the same /prefix bucket to replace with a "
+            "summarized CIDR (default 5; VAR: SUMMARIZE_MIN_HOSTS; "
+            "env: PAN_SUMMARIZE_MIN_HOSTS when VAR omits it)"
+        ),
+    )
+    p.add_argument(
+        "--summarize-prefix",
+        type=int,
+        metavar="P",
+        dest="summarize_prefix",
+        help=(
+            "Subnet prefix for grouping and summarized CIDR output (default 24; "
+            "VAR: SUMMARIZE_PREFIX; env: PAN_SUMMARIZE_PREFIX when VAR omits it)"
+        ),
+    )
+    p.add_argument(
+        "--summarize-report-only",
+        action="store_true",
+        dest="summarize_report_only",
+        help=(
+            "Analyze subnet summarization and print metrics without modifying "
+            "the EDL (VAR: SUMMARIZE_REPORT_ONLY=true; env: PAN_SUMMARIZE_REPORT_ONLY)"
         ),
     )
     args = p.parse_args(argv_rest)
@@ -1204,6 +1584,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     expired_new.extend(expired_cap)
 
+    ordered_after, summarize_stats = apply_subnet_summarization(
+        merged_m,
+        verbatim_m,
+        fetched_keys,
+        ordered_after,
+        enabled=bool(args.summarize),
+        min_hosts=int(args.summarize_min_hosts),
+        prefix=int(args.summarize_prefix),
+        report_only=bool(args.summarize_report_only),
+    )
+
     max_entries = int(args.max_entries)
     if max_entries < 1:
         max_entries = MAX_EDL_ENTRIES_DEFAULT
@@ -1242,6 +1633,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         max_entries=max_entries,
         today=today,
     )
+    summary.summarize = summarize_stats
     print_run_summary(
         summary,
         verbose=bool(args.verbose),
