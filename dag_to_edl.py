@@ -12,6 +12,7 @@ import argparse
 import ipaddress
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -40,6 +41,18 @@ def script_directory() -> str:
 
 def default_var_file_path() -> str:
     return os.path.join(script_directory(), DEFAULT_VAR_BASENAME)
+
+
+def default_notify_tool_script_path() -> str:
+    return os.path.join(
+        os.path.dirname(script_directory()),
+        "notify-tool",
+        "notify.py",
+    )
+
+
+def default_notify_tool_python() -> str:
+    return sys.executable
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +174,77 @@ def var_settings_to_arg_defaults(
             pass
     if "SUMMARIZE_REPORT_ONLY" in var and str(var["SUMMARIZE_REPORT_ONLY"]).strip():
         d["summarize_report_only"] = _parse_bool_var(str(var["SUMMARIZE_REPORT_ONLY"]))
+    if "NOTIFY_ENABLED" in var and str(var["NOTIFY_ENABLED"]).strip():
+        d["notify_enabled"] = _parse_bool_var(str(var["NOTIFY_ENABLED"]))
+    if "NOTIFY_VAR_FILE" in var and str(var["NOTIFY_VAR_FILE"]).strip():
+        d["notify_var_file"] = str(var["NOTIFY_VAR_FILE"]).strip()
+    if "NOTIFY_CHANNELS" in var and str(var["NOTIFY_CHANNELS"]).strip():
+        d["notify_channels"] = str(var["NOTIFY_CHANNELS"]).strip()
+    if "NOTIFY_TOOL_SCRIPT" in var and str(var["NOTIFY_TOOL_SCRIPT"]).strip():
+        d["notify_tool_script"] = str(var["NOTIFY_TOOL_SCRIPT"]).strip()
+    if "NOTIFY_TOOL_PYTHON" in var and str(var["NOTIFY_TOOL_PYTHON"]).strip():
+        d["notify_tool_python"] = str(var["NOTIFY_TOOL_PYTHON"]).strip()
     return d
+
+
+def send_notify_message(
+    *,
+    enabled: bool,
+    notify_tool_python: str,
+    notify_tool_script: str,
+    notify_var_file: Optional[str],
+    notify_channels: Optional[str],
+    level: str,
+    title: str,
+    message: str,
+) -> None:
+    if not enabled:
+        return
+    tool_script = str(notify_tool_script or "").strip()
+    if not tool_script:
+        print("warning: notify enabled but notify tool script is empty", file=sys.stderr)
+        return
+    if not os.path.isfile(tool_script):
+        print(
+            f"warning: notify enabled but tool not found: {tool_script}",
+            file=sys.stderr,
+        )
+        return
+    python_bin = str(notify_tool_python or "").strip() or sys.executable
+    cmd = [
+        python_bin,
+        tool_script,
+        "--message",
+        message,
+        "--title",
+        title,
+        "--level",
+        level,
+    ]
+    if notify_var_file:
+        cmd.extend(["--var-file", str(notify_var_file)])
+    if notify_channels:
+        cmd.extend(["--channels", str(notify_channels)])
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"warning: notify invocation failed: {exc}", file=sys.stderr)
+        return
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        if detail:
+            print(
+                f"warning: notify returned {proc.returncode}: {detail}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"warning: notify returned {proc.returncode}", file=sys.stderr)
 
 
 def extract_var_file_argv(argv: List[str]) -> Tuple[Optional[str], List[str]]:
@@ -1273,6 +1356,11 @@ def parse_args(
         "summarize_min_hosts": 5,
         "summarize_prefix": 24,
         "summarize_report_only": False,
+        "notify_enabled": False,
+        "notify_var_file": None,
+        "notify_channels": None,
+        "notify_tool_script": default_notify_tool_script_path(),
+        "notify_tool_python": default_notify_tool_python(),
     }
     runtime_defaults.update(var_arg_defaults)
     if "SUMMARIZE_MIN_HOSTS" not in merged_var:
@@ -1325,7 +1413,8 @@ def parse_args(
             "Keys: HOST, API_KEY, VSYS, GROUP (repeat per group), OUTPUT, TIMEOUT, "
             "MAX_ENTRIES, EXPIRED_OUTPUT, INSECURE, CA_BUNDLE, EXPIRE_DAYS, "
             "OUTPUT_BACKUP_COUNT, SUMMARIZE, SUMMARIZE_MIN_HOSTS, SUMMARIZE_PREFIX, "
-            "SUMMARIZE_REPORT_ONLY."
+            "SUMMARIZE_REPORT_ONLY, NOTIFY_ENABLED, NOTIFY_VAR_FILE, NOTIFY_CHANNELS, "
+            "NOTIFY_TOOL_SCRIPT, NOTIFY_TOOL_PYTHON."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1460,6 +1549,36 @@ def parse_args(
             "the EDL (VAR: SUMMARIZE_REPORT_ONLY=true; env: PAN_SUMMARIZE_REPORT_ONLY)"
         ),
     )
+    p.add_argument(
+        "--notify-enabled",
+        action="store_true",
+        dest="notify_enabled",
+        help="Enable notifier subprocess integration (VAR: NOTIFY_ENABLED)",
+    )
+    p.add_argument(
+        "--notify-var-file",
+        metavar="PATH",
+        dest="notify_var_file",
+        help="notify-tool var-file path passed through to notify.py (VAR: NOTIFY_VAR_FILE)",
+    )
+    p.add_argument(
+        "--notify-channels",
+        metavar="LIST",
+        dest="notify_channels",
+        help="Comma-separated notify-tool channels override (VAR: NOTIFY_CHANNELS)",
+    )
+    p.add_argument(
+        "--notify-tool-script",
+        metavar="PATH",
+        dest="notify_tool_script",
+        help="Path to notify.py script (VAR: NOTIFY_TOOL_SCRIPT)",
+    )
+    p.add_argument(
+        "--notify-tool-python",
+        metavar="PATH",
+        dest="notify_tool_python",
+        help="Python executable used for notify.py subprocess (VAR: NOTIFY_TOOL_PYTHON)",
+    )
     args = p.parse_args(argv_rest)
 
     return args, merged_var
@@ -1477,12 +1596,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(str(code), file=sys.stderr)
         return 2
 
+    def notify(level: str, title: str, message: str) -> None:
+        send_notify_message(
+            enabled=bool(args.notify_enabled),
+            notify_tool_python=str(args.notify_tool_python),
+            notify_tool_script=str(args.notify_tool_script),
+            notify_var_file=(str(args.notify_var_file).strip() or None)
+            if args.notify_var_file
+            else None,
+            notify_channels=(str(args.notify_channels).strip() or None)
+            if args.notify_channels
+            else None,
+            level=level,
+            title=title,
+            message=message,
+        )
+
+    def fail(code: int, message: str) -> int:
+        notify("error", "Palo DAG to EDL failed", message)
+        return code
+
     if not args.api_key or not str(args.api_key).strip():
         print(
             "error: missing API key; pass --api-key, set PAN_API_KEY, or VAR API_KEY",
             file=sys.stderr,
         )
-        return 2
+        return fail(2, "Missing API key; DAG export aborted before API calls.")
 
     argv_for_flags = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -1500,19 +1639,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             "error: missing --host (CLI) or HOST= in VAR files",
             file=sys.stderr,
         )
-        return 2
+        return fail(2, "Missing host value; DAG export aborted.")
     if not args.output or not str(args.output).strip():
         print(
             "error: missing --output (CLI) or OUTPUT= in VAR files",
             file=sys.stderr,
         )
-        return 2
+        return fail(2, "Missing output path; DAG export aborted.")
     if not groups:
         print(
             "error: no dynamic address groups; pass --group or set GROUP= in VAR files",
             file=sys.stderr,
         )
-        return 2
+        return fail(2, "No DAG groups were configured; export aborted.")
 
     expire_days = int(args.expire_days or 0)
     if expire_days < 0:
@@ -1524,7 +1663,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "error: --backup-count / OUTPUT_BACKUP_COUNT must be >= 0",
             file=sys.stderr,
         )
-        return 2
+        return fail(2, "Invalid backup count; must be >= 0.")
 
     lines = load_edl_lines(args.output)
     existing, verbatim, file_warns = parse_edl_file(lines)
@@ -1537,7 +1676,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"error: CA bundle is not a readable file: {ca_path}",
             file=sys.stderr,
         )
-        return 2
+        return fail(2, f"CA bundle path is invalid: {ca_path}")
 
     verify = resolve_requests_verify(bool(args.insecure), ca_path or None)
     today = utc_today()
@@ -1554,10 +1693,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     except requests.RequestException as e:
         print(f"error: HTTP request failed: {e}", file=sys.stderr)
-        return 1
+        return fail(1, f"HTTP request failed while fetching DAG members: {e}")
     except RuntimeError as e:
         print(f"error: {e}", file=sys.stderr)
-        return 1
+        return fail(1, f"DAG API request returned an error: {e}")
 
     merged = merge_edl(existing, member_to_groups, today)
     fetched_keys = set(member_to_groups.keys())
@@ -1610,7 +1749,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         rotate_numbered_backups(out_path, backup_count)
     except OSError as e:
         print(f"error: could not rotate output backups: {e}", file=sys.stderr)
-        return 1
+        return fail(1, f"Could not rotate output backups: {e}")
 
     write_edl_atomic(
         out_path,
@@ -1641,6 +1780,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         vsys=str(args.vsys),
         output_path=out_path,
         elapsed_seconds=time.perf_counter() - run_started,
+    )
+    notify(
+        "success",
+        "Palo DAG to EDL completed",
+        (
+            "## DAG to EDL Summary\n"
+            f"- Groups configured: `{len(groups)}`\n"
+            f"- Indicators fetched: `{summary.dag_fetched}`\n"
+            f"- Added: `{summary.added}`\n"
+            f"- Stale: `{summary.stale}`\n"
+            f"- Removed by age: `{summary.removed_age}`\n"
+            f"- Removed by capacity: `{summary.removed_capacity}`\n"
+            f"- Total output entries: `{summary.total}`\n"
+            f"- Output path: `{out_path}`\n"
+            f"- VSYS: `{args.vsys}`"
+        ),
     )
     return 0
 

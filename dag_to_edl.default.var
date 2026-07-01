@@ -19,6 +19,11 @@
 # SUMMARIZE_MIN_HOSTS=5    Minimum host IPs in the same /prefix bucket to summarize (env: PAN_SUMMARIZE_MIN_HOSTS)
 # SUMMARIZE_PREFIX=24      Subnet prefix for grouping and summarized CIDR output (env: PAN_SUMMARIZE_PREFIX)
 # SUMMARIZE_REPORT_ONLY=false   Analyze only; do not modify the EDL (env: PAN_SUMMARIZE_REPORT_ONLY)
+# NOTIFY_ENABLED=false
+# NOTIFY_VAR_FILE=
+# NOTIFY_CHANNELS=
+# NOTIFY_TOOL_SCRIPT=..\notify-tool\notify.py
+# NOTIFY_TOOL_PYTHON=python
 
 TIMEOUT=60
 MAX_ENTRIES=49999
@@ -29,3 +34,4 @@ SUMMARIZE=true
 SUMMARIZE_MIN_HOSTS=5
 SUMMARIZE_PREFIX=24
 SUMMARIZE_REPORT_ONLY=false
+NOTIFY_ENABLED=false
